@@ -32,12 +32,15 @@ import org.teiid.common.buffer.LobManager;
 import org.teiid.core.TeiidComponentException;
 import org.teiid.core.TeiidProcessingException;
 import org.teiid.core.id.IDGenerator;
+import org.teiid.core.types.DataTypeManager;
 import org.teiid.core.util.HashCodeUtil;
 import org.teiid.dqp.internal.process.Request;
 import org.teiid.language.SQLConstants;
 import org.teiid.metadata.Procedure;
 import org.teiid.query.QueryPlugin;
 import org.teiid.query.analysis.AnalysisRecord;
+import org.teiid.query.function.FunctionDescriptor;
+import org.teiid.query.function.FunctionLibrary;
 import org.teiid.query.mapping.relational.QueryNode;
 import org.teiid.query.metadata.BasicQueryMetadata;
 import org.teiid.query.metadata.QueryMetadataInterface;
@@ -85,6 +88,7 @@ import org.teiid.query.sql.visitor.AggregateSymbolCollectorVisitor;
 import org.teiid.query.sql.visitor.CorrelatedReferenceCollectorVisitor;
 import org.teiid.query.sql.visitor.ElementCollectorVisitor;
 import org.teiid.query.sql.visitor.ExpressionMappingVisitor;
+import org.teiid.query.sql.visitor.FunctionCollectorVisitor;
 import org.teiid.query.sql.visitor.GroupCollectorVisitor;
 import org.teiid.query.sql.visitor.GroupsUsedByElementsVisitor;
 import org.teiid.query.sql.visitor.ValueIteratorProviderCollectorVisitor;
@@ -187,6 +191,7 @@ public class RelationalPlanner {
 			withList = queryCommand.getWith();
 			if (withList != null) {
 	        	for (WithQueryCommand with : withList) {
+	        		context.getGroups().add(with.getGroupSymbol().getName());
 	        		QueryCommand subCommand = with.getCommand();
 	        		if (subCommand instanceof Query && ((Query)subCommand).getIsXML()) {
 	        			ProcessorPlan plan = QueryOptimizer.optimizePlan(subCommand, metadata, idGenerator, capFinder, analysisRecord, context);
@@ -273,6 +278,12 @@ public class RelationalPlanner {
     private static void assignWithClause(RelationalNode node, Map<String, WithQueryCommand> pushdownWith, Set<GroupSymbol> groups) {
         if(node instanceof AccessNode) {
             AccessNode accessNode = (AccessNode) node;
+            Map<GroupSymbol, RelationalPlan> subplans = accessNode.getSubPlans();
+            if (subplans != null) {
+            	for (RelationalPlan subplan : subplans.values()) {
+    				assignWithClause(subplan.getRootNode(), pushdownWith, groups);
+            	}
+            }
             Command command = accessNode.getCommand();
             if (command instanceof QueryCommand) {
             	groups.clear();
@@ -372,22 +383,6 @@ public class RelationalPlanner {
 			try {
 			    ArrayList<Reference> correlatedReferences = new ArrayList<Reference>();
 			    CorrelatedReferenceCollectorVisitor.collectReferences(subCommand, localGroupSymbols, correlatedReferences);
-			    if (node != null && node.getType() != NodeConstants.Types.JOIN && node.getType() != NodeConstants.Types.GROUP) {
-			    	PlanNode grouping = NodeEditor.findNodePreOrder(node, NodeConstants.Types.GROUP, NodeConstants.Types.SOURCE | NodeConstants.Types.JOIN);
-			    	if (grouping != null && !correlatedReferences.isEmpty()) {
-			    		SymbolMap map = (SymbolMap) grouping.getProperty(Info.SYMBOL_MAP);
-			    		Map<Expression, ElementSymbol> reverseMap = new HashMap<Expression, ElementSymbol>();
-			    		for (Map.Entry<ElementSymbol, Expression> entry : map.asMap().entrySet()) {
-							reverseMap.put(entry.getValue(), entry.getKey());
-						}
-			    		for (Reference reference : correlatedReferences) {
-							ElementSymbol correlatedGroupingCol = reverseMap.get(reference.getExpression());
-							if (correlatedGroupingCol != null) {
-								reference.setExpression(correlatedGroupingCol);
-							}
-						}
-			    	}
-			    }
 			    ProcessorPlan procPlan = QueryOptimizer.optimizePlan(subCommand, metadata, idGenerator, capFinder, analysisRecord, context);
 			    if (procPlan instanceof RelationalPlan && pushdownWith != null) {
 			    	Map<String, WithQueryCommand> parentPushdownWith = pushdownWith;
@@ -405,6 +400,23 @@ public class RelationalPlanner {
 			    }
 			    container.getCommand().setProcessorPlan(procPlan);
 			    setCorrelatedReferences(container, correlatedReferences);
+			    //update the correlated references to the appropriate grouping symbols
+			    if (node != null && node.getType() != NodeConstants.Types.JOIN && node.getType() != NodeConstants.Types.GROUP  && !correlatedReferences.isEmpty()) {
+			    	PlanNode grouping = NodeEditor.findNodePreOrder(node, NodeConstants.Types.GROUP, NodeConstants.Types.SOURCE | NodeConstants.Types.JOIN);
+			    	if (grouping != null) {
+			    		SymbolMap map = (SymbolMap) grouping.getProperty(Info.SYMBOL_MAP);
+			    		SymbolMap symbolMap = container.getCommand().getCorrelatedReferences();
+			    		for (Map.Entry<ElementSymbol, Expression> entry : map.asMap().entrySet()) {
+			    			if (!(entry.getValue() instanceof ElementSymbol)) {
+			    				continue; //currently can't be correlated on an aggregate
+			    			}
+			    			ElementSymbol es = (ElementSymbol)entry.getValue();
+			    			if (symbolMap.getMappedExpression(es) != null) {
+			    				symbolMap.addMapping(es, entry.getKey());
+			    			}
+						}
+			    	}
+			    }
 			} finally {
 				if (entries != null) {
 					entries.remove(stackEntry);
@@ -569,7 +581,7 @@ public class RelationalPlanner {
         return rules;
     }
 
-    private PlanNode executeRules(RuleStack rules, PlanNode plan)
+    public PlanNode executeRules(RuleStack rules, PlanNode plan)
         throws QueryPlannerException, QueryMetadataException, TeiidComponentException {
 
         boolean debug = analysisRecord.recordDebug();
@@ -978,7 +990,7 @@ public class RelationalPlanner {
      * @throws QueryMetadataException 
      * @throws TeiidProcessingException 
      */
-    void buildTree(FromClause clause, PlanNode parent)
+    void buildTree(FromClause clause, final PlanNode parent)
         throws QueryMetadataException, TeiidComponentException, TeiidProcessingException {
         
         PlanNode node = null;
@@ -1086,6 +1098,57 @@ public class RelationalPlanner {
         } else if (clause instanceof TableFunctionReference) {
         	TableFunctionReference tt = (TableFunctionReference)clause;
             GroupSymbol group = tt.getGroupSymbol();
+            //special handling to convert array table into a mergable construct
+            if (parent.getType() == NodeConstants.Types.JOIN && tt instanceof ArrayTable) {
+            	JoinType jt = (JoinType) parent.getProperty(Info.JOIN_TYPE);
+            	if (jt != JoinType.JOIN_FULL_OUTER && parent.getChildCount() > 0) {
+	            	ArrayTable at = (ArrayTable)tt;
+		        	//rewrite if deterministic and free of subqueries
+		        	if (FunctionCollectorVisitor.isNonDeterministic(at.getArrayValue())
+		        			|| ValueIteratorProviderCollectorVisitor.getValueIteratorProviders(at).isEmpty()) {
+		            	List<ElementSymbol> symbols = at.getProjectedSymbols();
+		        		FunctionLibrary funcLib = this.metadata.getFunctionLibrary();
+		                FunctionDescriptor descriptor = funcLib.findFunction(FunctionLibrary.ARRAY_GET, 
+		                		new Class[] { DataTypeManager.DefaultDataClasses.OBJECT, DataTypeManager.DefaultDataClasses.INTEGER });
+		                Query query = new Query();
+		                Select select = new Select();
+		                query.setSelect(select);
+		            	for (int i = 0; i < symbols.size(); i++) {
+		            		ElementSymbol es = symbols.get(i);
+		            		Function f = new Function(FunctionLibrary.ARRAY_GET, new Expression[] {(Expression) at.getArrayValue().clone(), new Constant(i + 1)});
+		            		f.setType(DataTypeManager.DefaultDataClasses.OBJECT);
+		                    f.setFunctionDescriptor(descriptor);
+		                    Expression ex = f;
+		            		if (es.getType() != DataTypeManager.DefaultDataClasses.OBJECT) {
+		            			ex = ResolverUtil.getConversion(ex, DataTypeManager.DefaultDataTypes.OBJECT, DataTypeManager.getDataTypeName(es.getType()), false, metadata.getFunctionLibrary());
+		            		}
+		            		select.addSymbol(new AliasSymbol(es.getShortName(), ex));
+		            	}
+		            	SubqueryFromClause sfc = new SubqueryFromClause(at.getGroupSymbol(), query);
+		            	sfc.setTable(true);
+		            	buildTree(sfc, parent);
+		            	if (!jt.isOuter()) {
+		            		//insert is null criteria
+		            		IsNullCriteria criteria = new IsNullCriteria((Expression) at.getArrayValue().clone());
+		            		if (sfc.getCommand().getCorrelatedReferences() != null) {
+			            		RuleMergeCriteria.ReferenceReplacementVisitor rrv = new RuleMergeCriteria.ReferenceReplacementVisitor(sfc.getCommand().getCorrelatedReferences());
+			            		PreOrPostOrderNavigator.doVisit(criteria, rrv, PreOrPostOrderNavigator.PRE_ORDER);
+		            		}
+			            	criteria.setNegated(true);
+			            	if (jt == JoinType.JOIN_CROSS) {
+			            		parent.setProperty(NodeConstants.Info.JOIN_TYPE, JoinType.JOIN_INNER);
+			            	}
+			            	List<Criteria> joinCriteria = (List<Criteria>) parent.getProperty(Info.JOIN_CRITERIA); 
+			            	if (joinCriteria == null) {
+			            		joinCriteria = new ArrayList<Criteria>(2);
+			            	}
+			            	joinCriteria.add(criteria);
+			                parent.setProperty(NodeConstants.Info.JOIN_CRITERIA, joinCriteria);
+		            	}
+		            	return;
+		        	}
+            	}
+            }
             node = NodeFactory.getNewNode(NodeConstants.Types.SOURCE);
             node.setProperty(NodeConstants.Info.TABLE_FUNCTION, tt);
             tt.setCorrelatedReferences(getCorrelatedReferences(parent, node, tt));
